@@ -1,0 +1,231 @@
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+#include <SparkFun_BNO080_Arduino_Library.h>
+
+BNO080 imu;
+
+// SD card
+File logFile;
+const int SD_CS = 15;   // D8 on ESP8266
+
+// IMU I2C pins
+const int I2C_SDA = 4;  // D2
+const int I2C_SCL = 5;  // D1
+
+bool logging = false;   // are we actively writing?
+int currentLogIndex = 1;
+
+// Quaternion reference values
+float q0_ref = 1, q1_ref = 0, q2_ref = 0, q3_ref = 0;
+
+// ======================================================
+// Quaternion multiplication
+// ======================================================
+void quatMultiply(float &w, float &x, float &y, float &z,
+                  float w2, float x2, float y2, float z2)
+{
+  float nw = w*w2 - x*x2 - y*y2 - z*z2;
+  float nx = w*x2 + x*w2 + y*z2 - z*y2;
+  float ny = w*y2 - x*z2 + y*w2 + z*x2;
+  float nz = w*z2 + x*y2 - y*x2 + z*w2;
+
+  w = nw; x = nx; y = ny; z = nz;
+}
+
+// ======================================================
+// Quaternion → Euler
+// ======================================================
+void quatToEuler(float w, float x, float y, float z,
+                 float &yaw, float &pitch, float &roll)
+{
+  yaw = atan2f(2.0f * (w*z + x*y),
+               1.0f - 2.0f * (y*y + z*z)) * 57.2958f;
+
+  float sinp = 2.0f * (w*y - z*x);
+  pitch = (fabs(sinp) >= 1) ?
+      copysignf(90.0f, sinp) :
+      asinf(sinp) * 57.2958f;
+
+  roll = atan2f(2.0f * (w*x + y*z),
+                1.0f - 2.0f * (x*x + y*y)) * 57.2958f;
+}
+
+// ======================================================
+// Create next LOGxxx.CSV
+// ======================================================
+bool createLogFile()
+{
+  char filename[16];
+
+  for (int i = 1; i < 1000; i++) {
+    sprintf(filename, "/LOG%03d.CSV", i);
+
+    if (!SD.exists(filename)) {
+      logFile = SD.open(filename, FILE_WRITE);
+      if (!logFile) return false;
+
+      currentLogIndex = i;
+
+      Serial.print("NEW LOG FILE: ");
+      Serial.println(filename);
+
+      logFile.println("time_ms,yaw,pitch,roll,gx,gy,gz,ax,ay,az,qw,qx,qy,qz");
+      logFile.flush();
+      return true;
+    }
+  }
+  return false;
+}
+
+// ======================================================
+// Setup
+// ======================================================
+void setup()
+{
+  Serial.begin(115200);
+  delay(200);
+
+  Serial.println("\nESP8266 IMU LOGGER READY");
+  Serial.println("Commands:");
+  Serial.println("  start  → begin logging");
+  Serial.println("  stop   → stop logging & close file");
+  Serial.println("  new    → create next file");
+  Serial.println("  r      → reset orientation");
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  Serial.println("Waiting for IMU power-up...");
+  delay(800);
+
+  imu.softReset();
+  delay(400);
+
+  // Initialize SD card
+  if (!SD.begin(SD_CS)) {
+    Serial.println("ERROR: SD init failed!");
+    while (1);
+  }
+  Serial.println("SD OK.");
+
+  // Initialize IMU
+  Serial.println("Initializing IMU...");
+  if (!imu.begin()) {
+    Serial.println("IMU not detected!");
+    while (1);
+  }
+
+  delay(1000);  // IMPORTANT for BNO086 firmware load
+
+  imu.enableGameRotationVector(100);
+  imu.enableGyro(100);
+
+  // ✔ Correct linear acceleration function for *your* library
+  imu.enableLinearAccelerometer(100);
+
+  Serial.println("IMU OK. Type 'start' to begin logging.");
+}
+
+// ======================================================
+// Loop
+// ======================================================
+uint32_t sampleCount = 0;
+
+void loop()
+{
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+
+    if (cmd == "start") {
+      Serial.print("STARTING LOG ");
+      Serial.println(currentLogIndex);
+
+      if (!logFile) {
+        if (!createLogFile()) Serial.println("ERROR: Could not create log file!");
+      }
+
+      logging = true;
+    }
+
+    else if (cmd == "stop") {
+      Serial.println("STOPPING LOG...");
+      logging = false;
+
+      if (logFile) {
+        logFile.flush();
+        logFile.close();
+        Serial.println("LOG CLOSED. Safe to remove SD card.");
+      }
+    }
+
+    else if (cmd == "new") {
+      Serial.println("CREATING NEW LOG FILE...");
+      if (logFile) {
+        logFile.flush();
+        logFile.close();
+      }
+      logging = false;
+
+      if (!createLogFile()) Serial.println("ERROR creating file!");
+    }
+
+    else if (cmd == "r" || cmd == "R") {
+      float qw = imu.getQuatReal();
+      float qx = imu.getQuatI();
+      float qy = imu.getQuatJ();
+      float qz = imu.getQuatK();
+
+      q0_ref =  qw;
+      q1_ref = -qx;
+      q2_ref = -qy;
+      q3_ref = -qz;
+
+      Serial.println("ORIENTATION RESET");
+    }
+  }
+
+  if (!logging) return;
+
+  if (imu.dataAvailable()) {
+    float w = imu.getQuatReal();
+    float x = imu.getQuatI();
+    float y = imu.getQuatJ();
+    float z = imu.getQuatK();
+
+    quatMultiply(w, x, y, z, q0_ref, q1_ref, q2_ref, q3_ref);
+
+    float yaw, pitch, roll;
+    quatToEuler(w, x, y, z, yaw, pitch, roll);
+
+    float gx = imu.getGyroX();
+    float gy = imu.getGyroY();
+    float gz = imu.getGyroZ();
+
+    // ✔ Correct linear acceleration getters
+    float ax = imu.getLinAccelX();
+    float ay = imu.getLinAccelY();
+    float az = imu.getLinAccelZ();
+
+    uint32_t t = millis();
+
+    logFile.print(t); logFile.print(',');
+    logFile.print(yaw); logFile.print(',');
+    logFile.print(pitch); logFile.print(',');
+    logFile.print(roll); logFile.print(',');
+    logFile.print(gx); logFile.print(',');
+    logFile.print(gy); logFile.print(',');
+    logFile.print(gz); logFile.print(',');
+    logFile.print(ax); logFile.print(',');
+    logFile.print(ay); logFile.print(',');
+    logFile.print(az); logFile.print(',');
+    logFile.print(w);  logFile.print(',');
+    logFile.print(x);  logFile.print(',');
+    logFile.print(y);  logFile.print(',');
+    logFile.println(z);
+
+    if (++sampleCount % 50 == 0) {
+      logFile.flush();
+    }
+  }
+}
