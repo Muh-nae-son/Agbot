@@ -13,10 +13,15 @@ const int SD_CS = 15;   // D8 on ESP8266
 const int I2C_SDA = 4;  // D2
 const int I2C_SCL = 5;  // D1
 
-// Quaternion reference for reset
+bool logging = false;   // are we actively writing?
+int currentLogIndex = 1;
+
+// Quaternion reference values
 float q0_ref = 1, q1_ref = 0, q2_ref = 0, q3_ref = 0;
 
-// Quaternion multiply
+// ======================================================
+// Quaternion multiplication
+// ======================================================
 void quatMultiply(float &w, float &x, float &y, float &z,
                   float w2, float x2, float y2, float z2)
 {
@@ -28,7 +33,7 @@ void quatMultiply(float &w, float &x, float &y, float &z,
   w = nw; x = nx; y = ny; z = nz;
 }
 
-// Quaternion → Euler angles
+// Quaternion → Euler
 void quatToEuler(float w, float x, float y, float z,
                  float &yaw, float &pitch, float &roll)
 {
@@ -36,16 +41,17 @@ void quatToEuler(float w, float x, float y, float z,
                1.0f - 2.0f * (y*y + z*z)) * 57.2958f;
 
   float sinp = 2.0f * (w*y - z*x);
-  if (fabs(sinp) >= 1)
-    pitch = copysignf(90.0f, sinp);
-  else
-    pitch = asinf(sinp) * 57.2958f;
+  pitch = (fabs(sinp) >= 1) ?
+      copysignf(90.0f, sinp) :
+      asinf(sinp) * 57.2958f;
 
   roll = atan2f(2.0f * (w*x + y*z),
                 1.0f - 2.0f * (x*x + y*y)) * 57.2958f;
 }
 
-// Create next available file LOGxxx.CSV
+// ======================================================
+// Create next LOGxxx.CSV
+// ======================================================
 bool createLogFile()
 {
   char filename[16];
@@ -57,7 +63,9 @@ bool createLogFile()
       logFile = SD.open(filename, FILE_WRITE);
       if (!logFile) return false;
 
-      Serial.print("Logging to: ");
+      currentLogIndex = i;
+
+      Serial.print("NEW LOG FILE: ");
       Serial.println(filename);
 
       logFile.println("time_ms,yaw,pitch,roll,gx,gy,gz,qw,qx,qy,qz");
@@ -68,35 +76,37 @@ bool createLogFile()
   return false;
 }
 
+// ======================================================
+// Setup
+// ======================================================
 void setup()
 {
   Serial.begin(115200);
   delay(200);
 
-  Serial.println("\nStarting ESP8266 IMU logger...");
+  Serial.println("\nESP8266 IMU LOGGER READY");
+  Serial.println("Commands:");
+  Serial.println("  start  → begin logging");
+  Serial.println("  stop   → stop logging & close file");
+  Serial.println("  new    → create next file (not logging)");
+  Serial.println("  r      → reset orientation");
+  Serial.println();
 
   // Start I2C
   Wire.begin(I2C_SDA, I2C_SCL);
 
-  // ***** IMPORTANT: SparkFun board needs full boot time *****
   Serial.println("Waiting for IMU power-up...");
-  delay(800);   // <-- This is critical for BNO086 on ESP8266
+  delay(800);
 
-  // Optional soft reset
   imu.softReset();
-  delay(400);   // Allow SH-2 firmware to reload
+  delay(400);
 
   // Initialize SD card
   if (!SD.begin(SD_CS)) {
-    Serial.println("SD init failed!");
+    Serial.println("ERROR: SD init failed!");
     while (1);
   }
-  Serial.println("SD card OK.");
-
-  if (!createLogFile()) {
-    Serial.println("Could not create log file!");
-    while (1);
-  }
+  Serial.println("SD OK.");
 
   // Initialize IMU
   Serial.println("Initializing IMU...");
@@ -105,21 +115,66 @@ void setup()
     while (1);
   }
 
-  imu.enableGameRotationVector(100);  // Drift-free orientation
-  imu.enableGyro(100);                // Angular velocity
+  imu.enableGameRotationVector(100);
+  imu.enableGyro(100);
 
-  Serial.println("IMU ready. Type 'r' to reset orientation.");
+  Serial.println("IMU OK. Type 'start' to begin logging.");
 }
 
+// ======================================================
+// Loop
+// ======================================================
 uint32_t sampleCount = 0;
 
 void loop()
 {
-  // Handle serial reset: 'r' resets quaternion reference
+  // -------------------------
+  // Handle incoming commands
+  // -------------------------
   if (Serial.available()) {
-    char c = Serial.read();
-    if (c == 'r' || c == 'R') {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
 
+    if (cmd == "start") {
+      Serial.print("STARTING LOG ");
+      Serial.println(currentLogIndex);
+
+      // If no file is open, create one
+      if (!logFile) {
+        if (!createLogFile()) {
+          Serial.println("ERROR: Could not create log file!");
+        }
+      }
+
+      logging = true;
+    }
+
+    else if (cmd == "stop") {
+      Serial.println("STOPPING LOG...");
+      logging = false;
+
+      if (logFile) {
+        logFile.flush();
+        logFile.close();
+        Serial.println("LOG CLOSED. Safe to remove SD card.");
+      }
+    }
+
+    else if (cmd == "new") {
+      Serial.println("CREATING NEW LOG FILE...");
+      if (logFile) {
+        logFile.flush();
+        logFile.close();
+      }
+      logging = false;
+
+      if (!createLogFile()) {
+        Serial.println("ERROR creating new file!");
+      }
+    }
+
+    else if (cmd == "r" || cmd == "R") {
+      // Reset quaternion reference
       float qw = imu.getQuatReal();
       float qx = imu.getQuatI();
       float qy = imu.getQuatJ();
@@ -130,19 +185,25 @@ void loop()
       q2_ref = -qy;
       q3_ref = -qz;
 
-      Serial.println("Orientation reset.");
+      Serial.println("ORIENTATION RESET");
     }
   }
 
-  // IMU data available
-  if (imu.dataAvailable()) {
+  // -------------------------
+  // LOGGING ENABLED?
+  // -------------------------
+  if (!logging) return;
 
+  // -------------------------
+  // IMU data available?
+  // -------------------------
+  if (imu.dataAvailable()) {
     float w = imu.getQuatReal();
     float x = imu.getQuatI();
     float y = imu.getQuatJ();
     float z = imu.getQuatK();
 
-    // Apply "zero" quaternion
+    // Apply orientation zeroing
     quatMultiply(w, x, y, z, q0_ref, q1_ref, q2_ref, q3_ref);
 
     float yaw, pitch, roll;
@@ -167,11 +228,8 @@ void loop()
     logFile.print(y);  logFile.print(',');
     logFile.println(z);
 
-    // Flush occasionally
     if (++sampleCount % 50 == 0) {
       logFile.flush();
     }
   }
-
-  delay(2);
 }
