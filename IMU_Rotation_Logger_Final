@@ -33,7 +33,9 @@ void quatMultiply(float &w, float &x, float &y, float &z,
   w = nw; x = nx; y = ny; z = nz;
 }
 
+// ======================================================
 // Quaternion → Euler
+// ======================================================
 void quatToEuler(float w, float x, float y, float z,
                  float &yaw, float &pitch, float &roll)
 {
@@ -68,6 +70,7 @@ bool createLogFile()
       Serial.print("NEW LOG FILE: ");
       Serial.println(filename);
 
+      // REMOVE acceleration columns
       logFile.println("time_ms,yaw,pitch,roll,gx,gy,gz,qw,qx,qy,qz");
       logFile.flush();
       return true;
@@ -88,11 +91,9 @@ void setup()
   Serial.println("Commands:");
   Serial.println("  start  → begin logging");
   Serial.println("  stop   → stop logging & close file");
-  Serial.println("  new    → create next file (not logging)");
+  Serial.println("  new    → create next file");
   Serial.println("  r      → reset orientation");
-  Serial.println();
 
-  // Start I2C
   Wire.begin(I2C_SDA, I2C_SCL);
 
   Serial.println("Waiting for IMU power-up...");
@@ -115,8 +116,12 @@ void setup()
     while (1);
   }
 
+  delay(1000);  // IMPORTANT for BNO086 firmware load
+
   imu.enableGameRotationVector(100);
   imu.enableGyro(100);
+
+  // ❌ Removed imu.enableLinearAccelerometer()
 
   Serial.println("IMU OK. Type 'start' to begin logging.");
 }
@@ -128,9 +133,6 @@ uint32_t sampleCount = 0;
 
 void loop()
 {
-  // -------------------------
-  // Handle incoming commands
-  // -------------------------
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
@@ -139,11 +141,8 @@ void loop()
       Serial.print("STARTING LOG ");
       Serial.println(currentLogIndex);
 
-      // If no file is open, create one
       if (!logFile) {
-        if (!createLogFile()) {
-          Serial.println("ERROR: Could not create log file!");
-        }
+        if (!createLogFile()) Serial.println("ERROR: Could not create log file!");
       }
 
       logging = true;
@@ -168,13 +167,10 @@ void loop()
       }
       logging = false;
 
-      if (!createLogFile()) {
-        Serial.println("ERROR creating new file!");
-      }
+      if (!createLogFile()) Serial.println("ERROR creating file!");
     }
 
     else if (cmd == "r" || cmd == "R") {
-      // Reset quaternion reference
       float qw = imu.getQuatReal();
       float qx = imu.getQuatI();
       float qy = imu.getQuatJ();
@@ -189,21 +185,14 @@ void loop()
     }
   }
 
-  // -------------------------
-  // LOGGING ENABLED?
-  // -------------------------
   if (!logging) return;
 
-  // -------------------------
-  // IMU data available?
-  // -------------------------
   if (imu.dataAvailable()) {
     float w = imu.getQuatReal();
     float x = imu.getQuatI();
     float y = imu.getQuatJ();
     float z = imu.getQuatK();
 
-    // Apply orientation zeroing
     quatMultiply(w, x, y, z, q0_ref, q1_ref, q2_ref, q3_ref);
 
     float yaw, pitch, roll;
@@ -215,7 +204,7 @@ void loop()
 
     uint32_t t = millis();
 
-    // Write CSV
+    // WRITE ONLY angular velocity + orientation
     logFile.print(t); logFile.print(',');
     logFile.print(yaw); logFile.print(',');
     logFile.print(pitch); logFile.print(',');
